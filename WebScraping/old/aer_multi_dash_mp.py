@@ -45,7 +45,7 @@ def s3_mark_incomplete(well_label: str):
 
 
 # ========= DEFAULT CONFIG =========
-WELLS_FILE = "wells.txt"
+WELLS_FILE = "../wells.txt"
 OUT_BASE   = Path(os.environ.get("AER_OUT_BASE", "Data"))
 TIMEOUT    = 20
 DELAY      = 0.1
