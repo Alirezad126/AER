@@ -587,6 +587,20 @@ def process_one_dashboard(driver, worker_tmp_dir: Path, well_root: Path,
         pause()
 
     close_dialog(driver)
+    # --- Upload all local Data (skipping existing files) ---
+    try:
+        rc = rclone_copy(
+            str(OUT_BASE),
+            S3_REMOTE_BASE,
+            rclone_bin=RCLONE_BIN
+        )
+        if rc in (0, None):
+            print(f"[info] uploaded after {wrapped_uwi}/{dash_code} (skip duplicates)")
+        else:
+            print(f"[warn] rclone upload failed with code {rc} after {wrapped_uwi}/{dash_code}")
+    except Exception as e:
+        print(f"[warn] upload error after {wrapped_uwi}/{dash_code}: {e}")
+
     return (downloaded, skipped)
 
 def process_one_well(driver, worker_tmp_dir: Path, out_base: Path, raw_uwi: str,
