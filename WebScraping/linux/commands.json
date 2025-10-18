@@ -1,7 +1,0 @@
-{
-  "commands": [
-    "cat >/tmp/run_aer.sh <<'EOF'\n#!/usr/bin/env bash\nset -euo pipefail\nexport RCLONE_CONFIG=/etc/rclone.conf\ncd /opt/aer-scraper/WebScraping/linux\nPART=$(cat /etc/aer/part || echo 00)\npython3.11 scrape_and_push.py wells_parts/wells_${PART}.txt --bucket aer-scrape-prod --remote s3aer --prefix Data --out-base /data/Data --workers 2 --dashboards Well_Summary_Report --headless\nEOF",
-    "chmod +x /tmp/run_aer.sh",
-    "bash /tmp/run_aer.sh"
-  ]
-}
