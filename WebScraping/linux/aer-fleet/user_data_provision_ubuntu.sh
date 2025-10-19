@@ -13,6 +13,7 @@ REMOTE_NAME="s3aer"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# --- base packages ---
 apt-get update -y
 apt-get upgrade -y
 apt-get install -y \
@@ -21,12 +22,26 @@ apt-get install -y \
   fonts-dejavu-core fonts-liberation \
   awscli
 
-# SSM Agent
+# --- 3 GB swap (uses root EBS space) ---
+if ! swapon --show | grep -q '^/swapfile'; then
+  fallocate -l 3G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=3072
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  if ! grep -q '^/swapfile ' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+  # keep RAM preferred over swap
+  echo -e 'vm.swappiness=20\nvm.vfs_cache_pressure=50' >/etc/sysctl.d/99-swap.conf
+  sysctl --system || true
+fi
+
+# --- SSM Agent ---
 snap install amazon-ssm-agent --classic || true
 systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent || true
 systemctl start  snap.amazon-ssm-agent.amazon-ssm-agent || true
 
-# Chrome
+# --- Google Chrome ---
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
 chmod a+r /etc/apt/keyrings/google-chrome.gpg
@@ -35,7 +50,7 @@ echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.
 apt-get update -y
 apt-get install -y google-chrome-stable
 
-# Python 3.11 + Selenium
+# --- Python 3.11 + Selenium ---
 add-apt-repository -y ppa:deadsnakes/ppa
 apt-get update -y
 apt-get install -y python3.11 python3.11-distutils python3.11-venv
@@ -43,7 +58,7 @@ curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
 python3.11 -m pip install --upgrade pip
 python3.11 -m pip install "selenium>=4.10"
 
-# rclone
+# --- rclone (env_auth to use instance role) ---
 curl -fsSL https://rclone.org/install.sh | bash
 cat > "${RCLONE_CFG}" <<EOF
 [${REMOTE_NAME}]
@@ -59,7 +74,7 @@ export RCLONE_CONFIG=${RCLONE_CFG}
 EOF
 chmod 0644 /etc/profile.d/rclone.sh
 
-# code
+# --- code checkout / update ---
 mkdir -p "${REPO_DIR}"
 if [ ! -d "${REPO_DIR}/.git" ]; then
   git clone --depth=1 "${REPO_URL}" "${REPO_DIR}"
@@ -67,11 +82,11 @@ else
   (cd "${REPO_DIR}" && git pull --ff-only) || true
 fi
 
-# wells_parts (optional hydrate)
+# --- hydrate wells_parts from S3 if available ---
 mkdir -p "${REPO_DIR}/${CODE_SUBDIR}/wells_parts"
 RCLONE_CONFIG="${RCLONE_CFG}" rclone copy "${REMOTE_NAME}:${BUCKET}/wells_parts" "${REPO_DIR}/${CODE_SUBDIR}/wells_parts" || true
 
-# record Part tag to /etc/aer/part
+# --- record Part tag to /etc/aer/part ---
 mkdir -p /etc/aer
 TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
 IID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || true)
@@ -80,5 +95,7 @@ aws ec2 describe-tags --region "${REGION}" \
   --query "Tags[0].Value" --output text > "${PART_FILE}" || echo "00" > "${PART_FILE}"
 chmod 0644 "${PART_FILE}"
 
+# --- data directory ---
 mkdir -p "${OUT_BASE}"
+
 echo "Provisioning complete. Ready for SSM trigger."

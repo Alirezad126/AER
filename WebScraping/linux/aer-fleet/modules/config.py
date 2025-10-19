@@ -11,7 +11,7 @@ USER_DATA_FILE = "user_data_provision_ubuntu.sh"
 S3_LOG_PREFIX = "runtime-logs"   # s3://<BUCKET>/runtime-logs/<Name>/<InstanceId>/aer-scrape.log
 
 # Scraper settings (you can edit defaults here)
-DASHBOARDS = "Well_Summary_Report"   # or "Reservoir_Evaluation" or "Well_Gas_Analysis" or "all"
+DASHBOARDS = "all"   # or "Reservoir_Evaluation" or "Well_Gas_Analysis" or "all"
 OUT_BASE = "/data/Data"
 REMOTE_NAME = "s3aer"
 PREFIX = "Data"                      # s3 folder under bucket
