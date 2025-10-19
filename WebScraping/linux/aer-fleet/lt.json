@@ -1,0 +1,40 @@
+{
+    "IamInstanceProfile": {
+        "Arn": "arn:aws:iam::381491845652:instance-profile/AERScrapeInstanceRole"
+    },
+    "BlockDeviceMappings": [
+        {
+            "DeviceName": "/dev/sda1",
+            "Ebs": {
+                "Encrypted": false,
+                "DeleteOnTermination": true,
+                "SnapshotId": "snap-044c7fd1c01a7978c",
+                "VolumeSize": 10,
+                "VolumeType": "gp2"
+            }
+        }
+    ],
+    "NetworkInterfaces": [
+        {
+            "AssociatePublicIpAddress": true,
+            "DeviceIndex": 0,
+            "Groups": [
+                "sg-031fab6d929c80422"
+            ]
+        }
+    ],
+    "ImageId": "ami-0bbdd8c17ed981ef9",
+    "InstanceType": "t3.medium",
+    "KeyName": "aer",
+    "SecurityGroupIds": [
+        "sg-031fab6d929c80422"
+    ],
+    "CreditSpecification": {
+        "CpuCredits": "unlimited"
+    },
+    "MetadataOptions": {
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 2,
+        "HttpEndpoint": "enabled"
+    }
+}

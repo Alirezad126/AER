@@ -17,7 +17,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 import subprocess, shlex  # add
-import gc  # SAFETY add
 
 # ---- S3 constants (match your existing upload path) ----
 RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
@@ -53,22 +52,6 @@ WORKERS    = 2
 # >>> top-level constants / args (add these near other constants)
 MANIFEST_RETRIES_DEFAULT = 5
 RETRY_WAIT_DEFAULT = 8.0
-
-# ---- SAFETY knobs (no logic change) ----
-RECYCLE_EVERY = 5          # recycle driver every 5 wells
-BATCH_PAUSE_SEC = 2.0      # pause after each recycle batch
-FD_SOFT_LIMIT = 20000      # recycle if our process FDs exceed this
-TARGET_NOFILE = 1048576    # best-effort raise of soft nofile for this process
-
-# Best-effort bump of Python process soft RLIMIT_NOFILE (won't change system)
-try:
-    import resource  # type: ignore
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = min(hard, TARGET_NOFILE)
-    if soft < target:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-except Exception:
-    pass
 
 # Normalizer behaviour
 ADD_UWI_FORMATTED = True
@@ -148,43 +131,6 @@ def parse_dashboards_spec(spec: Optional[str]) -> List[str]:
     wanted = [p.strip() for p in spec.split(",") if p.strip()]
     return [w for w in wanted if w in DASHBOARDS] or list(DASHBOARDS.keys())
 
-# ================= SAFETY HELPERS (no logic change) =================
-def num_open_fds() -> int:
-    try:
-        return len(os.listdir("/proc/self/fd"))
-    except Exception:
-        return -1
-
-def _remove_chrome_singletons():
-    for base in ["/root/.config/google-chrome", os.path.expanduser("~/.config/google-chrome")]:
-        try:
-            if not os.path.isdir(base):
-                continue
-            for name in os.listdir(base):
-                if name.startswith("Singleton"):
-                    try: os.remove(os.path.join(base, name))
-                    except Exception: pass
-        except Exception:
-            pass
-
-def safe_kill_stragglers():
-    try:
-        os.system("pkill -f chrome || true")
-        os.system("pkill -f chromedriver || true")
-    except Exception:
-        pass
-    _remove_chrome_singletons()
-
-def recycle_driver(old_driver, tmp_dir: Path, headless: bool):
-    """Close current driver, clear locks, GC, and create a fresh driver."""
-    try:
-        if old_driver: old_driver.quit()
-    except Exception:
-        pass
-    safe_kill_stragglers()
-    gc.collect()
-    return make_driver(tmp_dir, headless=headless)
-
 # --------------- selenium helpers ---------------
 def find_browser_binary():
     for cand in [
@@ -204,9 +150,6 @@ def make_driver(download_dir: Path, headless: bool):
     opts = Options()
     if headless: opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox"); opts.add_argument("--disable-dev-shm-usage")
-    # SAFETY-only flags that don't change scraping logic:
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-extensions")
     opts.add_argument("--window-size=1400,1000")
     opts.add_experimental_option("prefs", {
         "download.default_directory": str(download_dir.resolve()),
@@ -761,10 +704,8 @@ def worker_main(
                 )
             except Exception as e:
                 print(f"[warn] worker {worker_id} error on {uwi}: {e}")
-                # SAFETY: kill stragglers and recycle cleanly
                 try: driver.quit()
                 except Exception: pass
-                safe_kill_stragglers()
                 driver = make_driver(tmp_dir, headless=headless)
                 try:
                     process_one_well(
@@ -773,33 +714,12 @@ def worker_main(
                     )
                 except Exception as e2:
                     print(f"[warn] worker {worker_id} retry failed: {e2}")
-
-            # SAFETY: release page resources between wells
-            try:
-                driver.get("about:blank")
-            except Exception:
-                driver = recycle_driver(driver, tmp_dir, headless=headless)
-
-            # SAFETY: recycle on FD pressure
-            fds = num_open_fds()
-            if fds > 0 and fds >= FD_SOFT_LIMIT:
-                print(f"[info] worker {worker_id}: recycling driver due to FD pressure (fds={fds})")
-                driver = recycle_driver(driver, tmp_dir, headless=headless)
-
-            # SAFETY: recycle every N wells and pause briefly
-            if RECYCLE_EVERY and (idx % RECYCLE_EVERY == 0):
-                print(f"[info] worker {worker_id}: batch {idx} done — recycling & pausing {BATCH_PAUSE_SEC}s")
-                driver = recycle_driver(driver, tmp_dir, headless=headless)
-                time.sleep(BATCH_PAUSE_SEC)
-
             pause()
     finally:
         try:
             if driver: driver.quit()
         except Exception:
             pass
-        safe_kill_stragglers()
-
 def chunkify(seq: List[str], n: int) -> List[List[str]]:
     n = max(1, n); k, m = divmod(len(seq), n)
     out, start = [], 0

@@ -94,7 +94,6 @@ def _allocate_and_attach_eip(iid: str, name_tag: str):
         pass
     print(f"[ok] EIP {alloc['PublicIp']} associated → {iid} ({name_tag})")
 
-
 # --- add this helper near the top (below imports) ---
 def wait_instance_running(instance_ids: list[str]):
     print("waiting for instance state=running ...")
@@ -126,7 +125,6 @@ def _attach_eip_after_running(instance_id: str, name_tag: str):
     except Exception:
         pass
     print(f"[ok] EIP {alloc['PublicIp']} associated → {instance_id} ({name_tag})")
-
 
 
 # --- modify launch_one(): REMOVE the EIP call here ---

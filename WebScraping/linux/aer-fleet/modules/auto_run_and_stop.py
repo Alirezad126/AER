@@ -22,46 +22,18 @@ PREFIX="{prefix}"
 DASH="{dash}"
 SHUT_MODE="{shutdown}"
 
+# --- supervisor knobs (can be overridden in env before run) ---
+CYCLE_MIN="${{CYCLE_MIN:-20}}"       # run time per cycle before restart
+COOLDOWN_SEC="${{COOLDOWN_SEC:-60}}" # wait after stopping, before restart
+KILL_GRACE="${{KILL_GRACE:-0}}"     # seconds to allow graceful stop before SIGKILL
+
 export RCLONE_CONFIG=/etc/rclone.conf
 LOG=/var/log/aer-scrape.log
-REASON=/var/log/aer-stop.json
 : > "$LOG"
-: > "$REASON"
-
-# Ensure high NOFILE even under SSM non-interactive session
-ulimit -n 1048576 || true
 
 cd "$CODE_DIR"
 
-# ===== Reliable upload helpers =====
-# Upload a SNAPSHOT of a file (prevents checksum mismatches while a file is still being written)
-upload_s3_snapshot() {{
-  local src="$1" dst="$2"
-  local snap; snap=$(mktemp /tmp/aerlog.XXXXXX) || return 1
-  # Prefer cp; if copy fails for any reason, fall back to streaming copy
-  if ! cp -f "$src" "$snap" 2>>"$LOG"; then
-    cat "$src" >"$snap" 2>>"$LOG" || true
-  fi
-  local ok=1 tries=0
-  while [ $tries -lt 6 ]; do
-    tries=$((tries+1))
-    if aws s3 cp "$snap" "$dst" --region "$REGION" >>"$LOG" 2>&1; then
-      echo "$(date -Is) uploaded via aws: $src -> $dst" >>"$LOG"; ok=0; break
-    fi
-    local remote_dst="$REMOTE:$BUCKET/${{dst#s3://$BUCKET/}}"
-    if command -v rclone >/dev/null 2>&1; then
-      # copyto avoids directory scans; snapshot is stable so checksum will match
-      if rclone copyto "$snap" "$remote_dst" >>"$LOG" 2>&1; then
-        echo "$(date -Is) uploaded via rclone: $src -> $remote_dst" >>"$LOG"; ok=0; break
-      fi
-    fi
-    sleep $((2 ** tries))
-  done
-  rm -f "$snap" || true
-  return $ok
-}}
-
-# Identify instance
+# ----- identify instance -----
 TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
 IID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || true)
 NAME=$(curl -sfH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Name 2>/dev/null || true)
@@ -69,21 +41,69 @@ if [ -z "$NAME" ] || [ "$NAME" = "Not found" ]; then
   NAME=$(aws ec2 describe-tags --region "$REGION" --filters Name=resource-id,Values="$IID" Name=key,Values=Name --query "Tags[0].Value" --output text 2>/dev/null || echo "unknown")
 fi
 
-# Decide PART from Name suffix
+# ----- decide PART from Name suffix -----
 PART=""
-case "$NAME" in *-??) PART="${{NAME##*-}}";; esac
-if ! echo "$PART" | grep -Eq '^[0-9][0-9]$'; then PART=""; fi
-[ -z "$PART" ] && P_IMDS=$(curl -sfH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Part 2>/dev/null || true) && [ -n "$P_IMDS" ] && [ "$P_IMDS" != "Not found" ] && PART="$P_IMDS"
-[ -z "$PART" ] && P_DESC=$(aws ec2 describe-tags --region "$REGION" --filters Name=resource-id,Values="$IID" Name=key,Values=Part --query "Tags[0].Value" --output text 2>/dev/null || true) && [ -n "$P_DESC" ] && [ "$P_DESC" != "None" ] && PART="$P_DESC"
-[ -z "$PART" ] && [ -s /etc/aer/part ] && PART=$(cat /etc/aer/part || true)
-[ -z "$PART" ] && PART="00"
+case "$NAME" in
+  *-??) PART="${{NAME##*-}}";;
+esac
+if ! echo "$PART" | grep -Eq '^[0-9][0-9]$'; then
+  PART=""
+fi
 
-# Paths
+# Fallbacks
+if [ -z "$PART" ]; then
+  P_IMDS=$(curl -sfH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Part 2>/dev/null || true)
+  if [ -n "$P_IMDS" ] && [ "$P_IMDS" != "Not found" ]; then PART="$P_IMDS"; fi
+fi
+if [ -z "$PART" ]; then
+  P_DESC=$(aws ec2 describe-tags --region "$REGION" --filters Name=resource-id,Values="$IID" Name=key,Values=Part --query "Tags[0].Value" --output text 2>/dev/null || true)
+  if [ -n "$P_DESC" ] && [ "$P_DESC" != "None" ]; then PART="$P_DESC"; fi
+fi
+if [ -z "$PART" ] && [ -s /etc/aer/part ]; then PART=$(cat /etc/aer/part || true); fi
+if [ -z "$PART" ]; then PART="00"; fi
+
+# Compute paths/URIs
 WELLS_FILE="wells_parts/wells_$PART.txt"
-S3_LOG_URI="s3://$BUCKET/$S3_PREFIX/$NAME/$IID/aer-scrape.log"
-S3_STOP_URI="s3://$BUCKET/$S3_PREFIX/$NAME/$IID/stop_reason.json"
+S3_DIR="s3://$BUCKET/$S3_PREFIX/$NAME/$IID"
+S3_LOG_URI="$S3_DIR/aer-scrape.log"
+RCLONE_LOG_URI="$REMOTE:$BUCKET/$S3_PREFIX/$NAME/$IID/aer-scrape.log"
 
-# Header
+# ----- helpers -----
+s3_put_log() {{
+  # Try AWS CLI; if it fails (e.g., py deps broken), fall back to rclone
+  if ! aws s3 cp "$LOG" "$S3_LOG_URI" --region "$REGION" >/dev/null 2>&1; then
+    RCLONE_CONFIG="$RCLONE_CONFIG" rclone copyto "$LOG" "$RCLONE_LOG_URI" \
+      --s3-no-check-bucket --ignore-checksum --retries 3 --low-level-retries 3 \
+      >/dev/null 2>&1 || true
+  fi
+}}
+
+count_new_wells() {{
+  local base="$1" mark="$2"
+  local c=0
+  shopt -s nullglob
+  for d in "$base"/*; do
+    [ -d "$d" ] || continue
+    if find "$d" -type f -newer "$mark" -print -quit | grep -q .; then
+      c=$((c+1))
+    fi
+  done
+  echo "$c"
+}}
+
+count_total_wells() {{
+  find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | awk '{{print $1}}'
+}}
+
+upload_loop() {{
+  while kill -0 "$1" 2>/dev/null; do
+    s3_put_log
+    sleep 300
+  done
+  s3_put_log
+}}
+
+# ----- header -----
 {{
   echo "==== AER SCRAPER START ===="
   date -Is
@@ -96,12 +116,10 @@ S3_STOP_URI="s3://$BUCKET/$S3_PREFIX/$NAME/$IID/stop_reason.json"
   echo "Out base:         $OUT_BASE"
   echo "S3 bucket/prefix: s3://$BUCKET/$PREFIX"
   echo "S3 log URI:       $S3_LOG_URI"
-  echo "S3 stop JSON:     $S3_STOP_URI"
   echo "rclone remote:    $REMOTE"
   echo "Shutdown mode:    $SHUT_MODE"
-  echo "ulimit -n:        $(ulimit -n 2>/dev/null || echo unknown)"
-  aws --version 2>&1 || true
-  aws sts get-caller-identity --output json 2>>"$LOG" || true
+  echo "Supervisor cycle: ${{CYCLE_MIN}}min run, ${{COOLDOWN_SEC}}s cooldown, ${{KILL_GRACE}}s kill grace"
+  echo -n "ulimit -n:        "; ulimit -n || true
   command -v google-chrome >/dev/null && google-chrome --version || true
   command -v chromedriver   >/dev/null && chromedriver --version   || true
   python3.11 - <<'PY'
@@ -116,78 +134,88 @@ PY
   rclone version 2>/dev/null || true
   echo "==== ENV END ===="
 }} | tee -a "$LOG"
+s3_put_log
 
-# Mark run start & helpers
+# ----- mark run start -----
 START_MARK="/tmp/aer_run_start.$$"
 date -Is > "$START_MARK"
 
-count_new_wells() {{
-  local base="$1" mark="$2" c=0
-  shopt -s nullglob
-  for d in "$base"/*; do
-    [ -d "$d" ] || continue
-    if find "$d" -type f -newer "$mark" -print -quit | grep -q .; then c=$((c+1)); fi
+# ----- supervised cycles -----
+CYCLE_SEC=$(( CYCLE_MIN * 60 ))
+CYCLE_IDX=0
+FINAL_RC=0
+
+while :; do
+  CYCLE_IDX=$((CYCLE_IDX+1))
+  {{
+    echo "---- cycle $CYCLE_IDX: starting scraper ----"
+    date -Is
+  }} | tee -a "$LOG"
+  s3_put_log
+
+  set +e
+  python3.11 scrape_and_push.py "$WELLS_FILE" \
+    --bucket "$BUCKET" --remote "$REMOTE" --prefix "$PREFIX" \
+    --out-base "$OUT_BASE" --workers 2 --dashboards "$DASH" --headless \
+    --manifest-retries 5 --retry-wait 6 \
+    2>&1 | tee -a "$LOG" &
+  SPID=$!
+  upload_loop "$SPID" &
+  UPID=$!
+
+  START_TS=$(date +%s)
+  while kill -0 "$SPID" 2>/dev/null; do
+    NOW=$(date +%s)
+    ELAP=$((NOW - START_TS))
+    if [ "$ELAP" -ge "$CYCLE_SEC" ]; then
+      {{
+        echo "---- cycle $CYCLE_IDX: time budget ${{CYCLE_MIN}}min reached; stopping scraper ----"
+        date -Is
+      }} | tee -a "$LOG"
+      s3_put_log
+      kill -TERM "$SPID" 2>/dev/null || true
+      for i in $(seq 1 "$KILL_GRACE"); do
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$SPID" 2>/dev/null; then
+        echo "[info] cycle $CYCLE_IDX: SIGKILL scraper" | tee -a "$LOG"
+        kill -KILL "$SPID" 2>/dev/null || true
+      fi
+      break
+    fi
+    sleep 5
   done
-  echo "$c"
-}}
-count_total_wells() {{ find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | awk '{{print $1}}'; }}
 
-# Defaults used by EXIT trap
-NEW_WELLS=0
-TOTAL_WELLS=0
-STOP_REASON="normal-exit"
-RC=0
+  wait "$SPID" 2>/dev/null; RC=$?
+  wait "$UPID" 2>/dev/null || true
+  set -e
 
-# Write stop reason (runs on EXIT)
-write_stop_reason() {{
-  local rc_val="${{RC:-$?}}"
-  local ts="$(date -Is 2>/dev/null || true)"
-  cat > "$REASON" <<JSON || true
-{{
-  "timestamp": "${{ts}}",
-  "instance_id": "${{IID}}",
-  "name": "${{NAME}}",
-  "part": "${{PART}}",
-  "exit_code": ${{rc_val:-0}},
-  "reason": "${{STOP_REASON}}",
-  "shutdown_mode": "${{SHUT_MODE}}",
-  "new_wells": ${{NEW_WELLS:-0}},
-  "total_wells": ${{TOTAL_WELLS:-0}}
-}}
-JSON
-  upload_s3_snapshot "$REASON" "$S3_STOP_URI" || true
-}}
-on_term() {{ STOP_REASON="signal:TERM"; echo "$(date -Is) got SIGTERM" | tee -a "$LOG"; }}
-on_int()  {{ STOP_REASON="signal:INT";  echo "$(date -Is) got SIGINT"  | tee -a "$LOG"; }}
-on_hup()  {{ STOP_REASON="signal:HUP";  echo "$(date -Is) got SIGHUP"  | tee -a "$LOG"; }}
-trap write_stop_reason EXIT
-trap on_term TERM
-trap on_int  INT
-trap on_hup  HUP
+  if [ "$RC" -eq 0 ]; then
+    {{
+      echo "---- cycle $CYCLE_IDX: scraper completed naturally (rc=0); ending supervisor ----"
+      date -Is
+    }} | tee -a "$LOG"
+    s3_put_log
+    FINAL_RC="$RC"
+    break
+  else
+    {{
+      echo "---- cycle $CYCLE_IDX: scraper stopped (rc=$RC); cooling down ${{COOLDOWN_SEC}}s ----"
+      date -Is
+    }} | tee -a "$LOG"
+    s3_put_log
+    sleep "$COOLDOWN_SEC"
+    {{
+      echo "---- cycle $CYCLE_IDX: cooldown complete; restarting ----"
+      date -Is
+    }} | tee -a "$LOG"
+    s3_put_log
+    FINAL_RC="$RC"
+  fi
+done
 
-# Periodic log upload (snapshot each time)
-upload_loop() {{
-  while kill -0 "$1" 2>/dev/null; do
-    upload_s3_snapshot "$LOG" "$S3_LOG_URI" || true
-    sleep 300
-  done
-  upload_s3_snapshot "$LOG" "$S3_LOG_URI" || true
-}}
-
-# Run scraper
-set +e
-python3.11 scrape_and_push.py "$WELLS_FILE" \
-  --bucket "$BUCKET" --remote "$REMOTE" --prefix "$PREFIX" \
-  --out-base "$OUT_BASE" --workers 2 --dashboards "$DASH" --headless \
-  --manifest-retries 3 --retry-wait 6 \
-  2>&1 | tee -a "$LOG" &
-
-SPID=$!
-upload_loop "$SPID" &
-UPID=$!
-wait "$SPID"; RC=$?
-
-# Post-run counts
+# ----- post-run well counts -----
 NEW_WELLS=$(count_new_wells "$OUT_BASE" "$START_MARK")
 TOTAL_WELLS=$(count_total_wells "$OUT_BASE" || echo 0)
 {{
@@ -195,31 +223,22 @@ TOTAL_WELLS=$(count_total_wells "$OUT_BASE" || echo 0)
   date -Is
   echo "New wells this run:   $NEW_WELLS"
   echo "Total wells on disk:  $TOTAL_WELLS"
-  echo "Scraper exit code:    $RC"
+  echo "Scraper exit code:    $FINAL_RC"
   echo "============================="
 }} | tee -a "$LOG"
+s3_put_log
 
-[ "$RC" -ne 0 ] && STOP_REASON="nonzero-exit" || true
-wait "$UPID" || true
-
-# Final best-effort uploads (snapshot to avoid checksum mismatch)
-upload_s3_snapshot "$LOG" "$S3_LOG_URI" || true
-upload_s3_snapshot "$REASON" "$S3_STOP_URI" || true
-
-# Optional self-shutdown
+# ----- optional self-shutdown -----
 if [ "$SHUT_MODE" = "stop" ] || [ "$SHUT_MODE" = "terminate" ]; then
-  upload_s3_snapshot "$LOG" "$S3_LOG_URI" || true
-  upload_s3_snapshot "$REASON" "$S3_STOP_URI" || true
+  s3_put_log
   if [ "$SHUT_MODE" = "stop" ]; then
-    # For EBS-backed Linux, a clean poweroff transitions instance to Stopped
-    systemctl poweroff || shutdown -h now || true
+    aws ec2 stop-instances --instance-ids "$IID" --region "$REGION" || true
   else
-    # Termination still uses AWS API; if CLI is broken, instance will just power off
-    aws ec2 terminate-instances --instance-ids "$IID" --region "$REGION" >>"$LOG" 2>&1 || true
+    aws ec2 terminate-instances --instance-ids "$IID" --region "$REGION" || true
   fi
 fi
 
-exit $RC
+exit "$FINAL_RC"
 """
 
 def _fmt_wrapper(shutdown: str):
@@ -253,7 +272,8 @@ def _wait_ssm_online(iid: str):
     while True:
         info = ssm.describe_instance_information()["InstanceInformationList"]
         ok = any(i["InstanceId"] == iid and i["PingStatus"] == "Online" for i in info)
-        if ok: return
+        if ok:
+            return
         time.sleep(8)
 
 def _send_start(iid: str, shutdown_mode: str) -> str:
@@ -305,13 +325,13 @@ def _poll_and_shutdown(mapping: Dict[str, str], stop: bool, terminate: bool):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Start scraping on targets; optional self-shutdown on instance; reliable S3 log uploads + stop-reason JSON."
+        description="Start scraping on targets; optional self-shutdown on instance; periodic restarts; S3 log uploads."
     )
     tgt = ap.add_mutually_exclusive_group(required=True)
     tgt.add_argument("--all", action="store_true", help=f"target all instances with tag Role={ROLE_TAG}")
     tgt.add_argument("--ids", nargs="+", help="instance-ids")
     tgt.add_argument("--names", nargs="+", help="Name tags")
-    tgt.add_argument("--parts", nargs="+", help="Part numbers, e.g., 00 01 02")
+    tgt.add_argument("--parts", nargs="+", help="Part numbers, e.g. 00 01 02")
 
     act = ap.add_mutually_exclusive_group(required=True)
     act.add_argument("--stop", action="store_true", help="controller stops instances when run finishes")
@@ -323,7 +343,8 @@ def main():
 
     targets = _list_targets(args.all, args.ids or [], args.names or [], args.parts or [])
     if not targets:
-        print("No targets found."); return
+        print("No targets found.")
+        return
 
     for iid in targets:
         _wait_ssm_online(iid)
