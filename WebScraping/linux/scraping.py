@@ -673,7 +673,7 @@ def process_one_dashboard(driver, worker_tmp_dir: Path, well_root: Path,
         ensure_csv_format(driver, TIMEOUT); click_dialog_export(driver, TIMEOUT)
 
         saved = wait_for_download_and_move(
-            worker_download_dir=worker_download_dir,
+            worker_download_dir=worker_tmp_dir,
             target_dir=dash_dir,
             file_label=file_label,
             sheet_name=sheet,
