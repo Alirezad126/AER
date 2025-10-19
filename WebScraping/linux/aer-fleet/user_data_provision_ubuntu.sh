@@ -20,7 +20,7 @@ apt-get install -y \
   ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common \
   git unzip jq tar gzip \
   fonts-dejavu-core fonts-liberation \
-  awscli
+  awscli lsof
 
 # --- 3 GB swap (uses root EBS space) ---
 if ! swapon --show | grep -q '^/swapfile'; then
@@ -35,6 +35,44 @@ if ! swapon --show | grep -q '^/swapfile'; then
   echo -e 'vm.swappiness=20\nvm.vfs_cache_pressure=50' >/etc/sysctl.d/99-swap.conf
   sysctl --system || true
 fi
+
+# --- Raise NOFILE limits everywhere (interactive shells + services) ---
+# 1) Kernel-wide ceiling for total open files
+echo 'fs.file-max=2097152' >/etc/sysctl.d/99-fs-file-max.conf
+sysctl --system || true
+
+# 2) PAM limits for login shells (ubuntu + root)
+mkdir -p /etc/security/limits.d
+cat >/etc/security/limits.d/99-nofile.conf <<'EOF'
+*     soft nofile 1048576
+*     hard nofile 1048576
+root  soft nofile 1048576
+root  hard nofile 1048576
+EOF
+
+# Ensure pam_limits is enabled for sessions
+for f in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
+  if ! grep -q 'pam_limits.so' "$f"; then
+    echo 'session required pam_limits.so' >> "$f"
+  fi
+done
+
+# 3) Systemd defaults for future services (so units inherit high NOFILE)
+#    These apply to NEW services started after this change.
+sed -i -e 's/^#\?DefaultLimitNOFILE=.*$/DefaultLimitNOFILE=1048576/' /etc/systemd/system.conf || true
+sed -i -e 's/^#\?DefaultLimitNOFILE=.*$/DefaultLimitNOFILE=1048576/' /etc/systemd/user.conf || true
+# Reload systemd to pick up defaults (does not reboot)
+systemctl daemon-reexec || true
+
+# 4) Make interactive shells start with high NOFILE too
+cat >/etc/profile.d/99-ulimit-nofile.sh <<'EOF'
+# Raise soft nofile for interactive shells (hard stays at PAM limit)
+ulimit -n 1048576 || true
+EOF
+chmod 0644 /etc/profile.d/99-ulimit-nofile.sh
+
+# Also raise for THIS script's current shell (useful immediately)
+ulimit -n 1048576 || true
 
 # --- SSM Agent ---
 snap install amazon-ssm-agent --classic || true
@@ -98,4 +136,4 @@ chmod 0644 "${PART_FILE}"
 # --- data directory ---
 mkdir -p "${OUT_BASE}"
 
-echo "Provisioning complete. Ready for SSM trigger."
+echo "Provisioning complete. High NOFILE limits are set. Ready for SSM trigger."

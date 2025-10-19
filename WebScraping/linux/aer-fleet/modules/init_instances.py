@@ -94,16 +94,44 @@ def _allocate_and_attach_eip(iid: str, name_tag: str):
         pass
     print(f"[ok] EIP {alloc['PublicIp']} associated → {iid} ({name_tag})")
 
-def launch_one(part: int,
-               enable_imds_tags: bool,
-               ip_mode: str,
-               subnet_rr: Optional[List[str]],
-               lt_has_nics: bool) -> str:
+
+# --- add this helper near the top (below imports) ---
+def wait_instance_running(instance_ids: list[str]):
+    print("waiting for instance state=running ...")
+    waiter = ec2.get_waiter("instance_running")
+    waiter.wait(InstanceIds=instance_ids)
+
+def _attach_eip_after_running(instance_id: str, name_tag: str):
     """
-    ip_mode: 'eip' | 'public' | 'none'
-    subnet_rr: optional list of public subnet ids; when provided we round-robin (for 'public' or even 'none' if LT doesn't define NICs)
+    Allocate + attach an Elastic IP to a RUNNING instance.
+    Retries briefly in case the ENI isn't ready the millisecond we try.
     """
-    assert ip_mode in ("eip", "public", "none")
+    # Allocate after it's running, so we don't hold addresses for long
+    alloc = ec2.allocate_address(Domain="vpc")
+    alloc_id = alloc["AllocationId"]
+    for attempt in range(1, 6):
+        try:
+            ec2.associate_address(InstanceId=instance_id, AllocationId=alloc_id)
+            break
+        except botocore.exceptions.ClientError as e:
+            # e.g. InvalidInstanceID.IncorrectState – give it a second
+            if attempt == 5:
+                raise
+            time.sleep(2 * attempt)
+    # tag the allocation for bookkeeping
+    try:
+        ec2.create_tags(Resources=[alloc_id],
+                        Tags=[{"Key":"Name","Value":name_tag},
+                              {"Key":"Role","Value":ROLE_TAG}])
+    except Exception:
+        pass
+    print(f"[ok] EIP {alloc['PublicIp']} associated → {instance_id} ({name_tag})")
+
+
+
+# --- modify launch_one(): REMOVE the EIP call here ---
+def launch_one(part: int, enable_imds_tags: bool, ip_mode: str,
+               subnet_rr: Optional[List[str]], lt_has_nics: bool) -> tuple[str, str]:
     name = f"{NAME_PREFIX}-{part:02d}"
     ud_txt = Path(USER_DATA_FILE).read_text()
     ud_b64 = base64.b64encode(ud_txt.encode("utf-8")).decode("ascii")
@@ -126,41 +154,19 @@ def launch_one(part: int,
         },
     }
 
-    # --- Choose subnet for this instance if possible ---
     chosen_subnet = None
     if subnet_rr and not lt_has_nics:
-        # We can provide SubnetId only if LT does not define NICs
         idx = part % len(subnet_rr)
         chosen_subnet = subnet_rr[idx]
         req["SubnetId"] = chosen_subnet
-
-    # NOTE:
-    # If LT defines NetworkInterfaces, we cannot set SubnetId here (AWS error).
-    # Ensure your LT's NIC uses a public subnet (and AssociatePublicIpAddress=true) if you want public IPs,
-    # or use ip_mode='eip' to attach Elastic IPs post-launch regardless of subnet.
 
     resp = ec2.run_instances(**req)
     iid = resp["Instances"][0]["InstanceId"]
     print(f"launched {name} => {iid}{' in '+chosen_subnet if chosen_subnet else ''}")
 
-    # --- Post-launch egress setup ---
-    if ip_mode == "public":
-        if lt_has_nics:
-            print("[warn] LT defines NetworkInterfaces; cannot enforce public IP at run time. "
-                  "Make sure the LT NIC is in a public subnet with AssociatePublicIpAddress enabled.")
-        else:
-            # We relied on the subnet's MapPublicIpOnLaunch setting.
-            if chosen_subnet:
-                flag = _subnet_maps_public_ip(chosen_subnet)
-                if flag is False:
-                    print(f"[warn] Subnet {chosen_subnet} does NOT map public IP on launch. "
-                          f"Enable it or use --ip-mode eip for guaranteed unique IPs.")
-    elif ip_mode == "eip":
-        # EIP works even in private subnets (outbound via NAT will still exist), but for direct egress,
-        # you normally place instances in a public subnet with IGW and a security group allowing outbound 443.
-        _allocate_and_attach_eip(iid, name)
+    # DO NOT attach EIP here; instance is still pending.
+    return iid, name
 
-    return iid
 
 def wait_instance_ok(instance_ids: List[str]):
     print("waiting for instance-status-ok ...")
@@ -209,10 +215,12 @@ def main():
             print("[warn] could not determine role from Launch Template; skipping policy attach")
 
     # Launch
+    # --- in main(): collect names, then attach EIPs *after* instances are running/OK ---
     ids = []
+    names = {}
     for i in range(args.count):
         part = args.start_part + i
-        iid = launch_one(
+        iid, name = launch_one(
             part=part,
             enable_imds_tags=args.enable_imds_tags,
             ip_mode=args.ip_mode,
@@ -220,13 +228,23 @@ def main():
             lt_has_nics=lt_has_nics
         )
         ids.append(iid)
+        names[iid] = name
 
-    # Health + SSM
+    # Wait until they are running (and then status-ok, as you already had)
+    wait_instance_running(ids)
     wait_instance_ok(ids)
+
+    # Attach EIPs now, if requested
+    if args.ip_mode == "eip":
+        for iid in ids:
+            _attach_eip_after_running(iid, names[iid])
+
+    # Finally wait for SSM Online
     for iid in ids:
         wait_ssm_online(iid)
 
     print(json.dumps({"instances": ids}, indent=2))
+
 
 if __name__ == "__main__":
     main()
