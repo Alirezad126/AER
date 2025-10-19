@@ -71,6 +71,11 @@ def main():
     ap.add_argument("--dashboards", default="all", help="Comma list or 'all'")
     ap.add_argument("--headless", action="store_true", help="Run scraper headless")
     ap.add_argument("--force", action="store_true", help="Force re-download (not recommended)")
+    # argparse additions
+    ap.add_argument("--manifest-retries", type=int, default=None,
+                    help="Retries for empty sheets.txt (default 5 in scraper)")
+    ap.add_argument("--retry-wait", type=float, default=None,
+                    help="Seconds between manifest retries (default 8 in scraper)")
 
     # rclone target
     ap.add_argument("--remote", default="s3aer", help="rclone remote name")
@@ -117,6 +122,10 @@ def main():
     ]
     if args.headless: cmd.append("--headless")
     if args.force:    cmd.append("--force")
+    if args.manifest_retries is not None:
+        cmd += ["--manifest-retries", str(args.manifest_retries)]
+    if args.retry_wait is not None:
+        cmd += ["--retry-wait", str(args.retry_wait)]
     print("[info] run:", " ".join(shlex.quote(c) for c in cmd))
     res = subprocess.run(cmd)
     if res.returncode not in (0, None): sys.exit(res.returncode)

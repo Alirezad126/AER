@@ -49,6 +49,9 @@ OUT_BASE   = Path("Data")
 TIMEOUT    = 40           # seconds for Selenium waits
 DELAY      = 0.3          # small pause between UI actions
 WORKERS    = 2
+# >>> top-level constants / args (add these near other constants)
+MANIFEST_RETRIES_DEFAULT = 5
+RETRY_WAIT_DEFAULT = 8.0
 
 # Normalizer behaviour
 ADD_UWI_FORMATTED = True
@@ -190,6 +193,16 @@ def open_crosstab(driver):
         ))
     )
     driver.execute_script("arguments[0].click();", item); pause()
+
+def reload_dashboard(driver, dash_code: str, dash_base: str, wrapped_uwi: str):
+    # reload same URL with a cache-busting ts param
+    ts = int(time.time() * 1000)
+    driver.get(url_for(dash_code, dash_base, wrapped_uwi) + f"&ts={ts}")
+    pause()
+    guard_session_reset(driver)
+    enter_viz_context(driver)
+    pause()
+
 
 def close_dialog(driver):
     for xp in [
@@ -502,43 +515,76 @@ def click_dialog_export(driver, timeout: int):
 # --------------- per-well & per-dashboard ---------------
 def process_one_dashboard(driver, worker_tmp_dir: Path, well_root: Path,
                           short_uwi: str, wrapped_uwi: str, file_label: str,
-                          dash_code: str, dash_base: str, force: bool) -> Tuple[int,int]:
+                          dash_code: str, dash_base: str, force: bool,
+                          manifest_retries: int = MANIFEST_RETRIES_DEFAULT,
+                          retry_wait: float = RETRY_WAIT_DEFAULT) -> Tuple[int,int]:
+
     dash_dir = well_root / dash_code
     dash_dir.mkdir(parents=True, exist_ok=True)
-    # If we don't have a local manifest, try to hydrate it from S3.
+
+    # Try to hydrate a local manifest from S3 if present
     if not force:
         local_manifest = dash_dir / "sheets.txt"
         if not local_manifest.exists():
             s3_files = s3_list_dash_files(wrapped_uwi, dash_code)
             if s3_files is not None and "sheets.txt" in s3_files:
                 s3_sheets = s3_read_manifest(wrapped_uwi, dash_code)
-                if s3_sheets is not None:
-                    # Write manifest locally to enable the existing fast-path logic
+                if s3_sheets is not None and s3_sheets:
                     try:
                         local_manifest.write_text("\n".join(s3_sheets), encoding="utf-8")
                     except Exception:
                         pass
 
-
+    # If local manifest covers everything, skip work
     if not force:
         manifest_sheets, missing = compute_missing_sheets_for_dashboard(well_root, file_label, dash_code)
         if manifest_sheets is not None and missing is not None and len(missing) == 0:
-            return (0, len(manifest_sheets))  # nothing to do
+            return (0, len(manifest_sheets))
 
-    driver.get(url_for(dash_code, dash_base, wrapped_uwi)); pause()
-    guard_session_reset(driver); enter_viz_context(driver); pause()
+    # === Try to open Crosstab and get a non-empty sheet list, with retries ===
+    attempt = 0
+    sheets: List[str] = []
+    while attempt <= max(0, manifest_retries):
+        attempt += 1
 
-    state = open_crosstab_and_wait_state(driver)
-    if state == "empty":
-        (dash_dir / "sheets.txt").write_text("", encoding="utf-8")
-        close_dialog(driver); return (0, 0)
+        # First load / reload
+        if attempt == 1:
+            driver.get(url_for(dash_code, dash_base, wrapped_uwi)); pause()
+            guard_session_reset(driver); enter_viz_context(driver); pause()
+        else:
+            print(f"[retry] {short_uwi}/{dash_code}: retry {attempt-1}/{manifest_retries} after empty sheets")
+            time.sleep(retry_wait)
+            reload_dashboard(driver, dash_code, dash_base, wrapped_uwi)
 
-    # pull/refresh manifest now
-    ensure_csv_format(driver, TIMEOUT)
-    sheets = list_crosstab_sheets(driver, TIMEOUT)
-    (dash_dir / "sheets.txt").write_text("\n".join(sheets), encoding="utf-8")
-    pause()
+        state = open_crosstab_and_wait_state(driver)
+        if state == "empty":
+            # keep retrying until attempts exhausted
+            if attempt <= manifest_retries:
+                close_dialog(driver)
+                continue
+            # last try: record empty manifest and exit
+            (dash_dir / "sheets.txt").write_text("", encoding="utf-8")
+            close_dialog(driver)
+            print(f"[info] {short_uwi}/{dash_code}: no sheets after {manifest_retries} retries")
+            return (0, 0)
 
+        # got dialog—extract sheet list
+        ensure_csv_format(driver, TIMEOUT)
+        sheets = list_crosstab_sheets(driver, TIMEOUT)
+        if sheets:
+            (dash_dir / "sheets.txt").write_text("\n".join(sheets), encoding="utf-8")
+            pause()
+            break  # success
+        else:
+            # dialog exists but list empty—retry
+            close_dialog(driver)
+            if attempt > manifest_retries:
+                (dash_dir / "sheets.txt").write_text("", encoding="utf-8")
+                print(f"[info] {short_uwi}/{dash_code}: empty sheet list after {manifest_retries} retries")
+                return (0, 0)
+            continue
+
+    # from here on, 'sheets' is non-empty (or we'd have returned)
     to_download, skipped = [], 0
     if force:
         to_download = sheets[:]
@@ -549,17 +595,13 @@ def process_one_dashboard(driver, worker_tmp_dir: Path, well_root: Path,
                 skipped += 1
             else:
                 to_download.append(s)
+
         if not to_download:
             try:
-                rclone_copy(
-                    str(dash_dir),
-                    f"{S3_REMOTE_BASE}/{sanitize_name(wrapped_uwi)}/{dash_code}",
-                    rclone_bin="rclone"
-                )
+                rclone_copy(str(dash_dir), f"{S3_REMOTE_BASE}/{sanitize_name(wrapped_uwi)}/{dash_code}", rclone_bin="rclone")
             except Exception as e:
                 print(f"[warn] upload failed for {short_uwi}/{dash_code}: {e}")
-
-            close_dialog(driver); return (0, skipped)
+            return (0, skipped)
 
     downloaded = 0
     for sheet in to_download:
@@ -603,8 +645,16 @@ def process_one_dashboard(driver, worker_tmp_dir: Path, well_root: Path,
 
     return (downloaded, skipped)
 
-def process_one_well(driver, worker_tmp_dir: Path, out_base: Path, raw_uwi: str,
-                     selected_dashboards: List[str], force: bool):
+def process_one_well(
+    driver,
+    worker_tmp_dir: Path,
+    out_base: Path,
+    raw_uwi: str,
+    selected_dashboards: List[str],
+    force: bool,
+    manifest_retries: int,
+    retry_wait: float,
+):
     # Folder by SHORT UWI (no slashes), file names by FULL WRAPPED UWI
     short_uwi  = to_short_uwi(raw_uwi)
     wrapped_uwi = ensure_wrapped(raw_uwi)
@@ -620,16 +670,27 @@ def process_one_well(driver, worker_tmp_dir: Path, out_base: Path, raw_uwi: str,
             dl, sk = process_one_dashboard(
                 driver, worker_tmp_dir, well_root,
                 short_uwi, wrapped_uwi, file_label,
-                code, base, force
+                code, base, force,
+                manifest_retries=manifest_retries,
+                retry_wait=retry_wait
             )
-            total_dl += dl; total_skip += sk
+            total_dl += dl;
+            total_skip += sk
         except Exception as e:
             print(f"[warn] {short_uwi}/{code}: {e}")
         pause()
     print(f"well {short_uwi}: downloaded {total_dl}, skipped {total_skip}")
 
 # --------------- multiprocessing ---------------
-def worker_main(worker_id: int, wells: List[str], selected_dashboards: List[str], force: bool, headless: bool):
+def worker_main(
+    worker_id: int,
+    wells: List[str],
+    selected_dashboards: List[str],
+    force: bool,
+    headless: bool,
+    manifest_retries: int,
+    retry_wait: float,
+):
     tmp_dir = OUT_BASE / f"_tmp_worker_{worker_id}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     driver = None
@@ -637,14 +698,20 @@ def worker_main(worker_id: int, wells: List[str], selected_dashboards: List[str]
         driver = make_driver(tmp_dir, headless=headless)
         for idx, uwi in enumerate(wells, 1):
             try:
-                process_one_well(driver, tmp_dir, OUT_BASE, uwi, selected_dashboards, force)
+                process_one_well(
+                    driver, tmp_dir, OUT_BASE, uwi, selected_dashboards, force,
+                    manifest_retries=manifest_retries, retry_wait=retry_wait
+                )
             except Exception as e:
                 print(f"[warn] worker {worker_id} error on {uwi}: {e}")
                 try: driver.quit()
                 except Exception: pass
                 driver = make_driver(tmp_dir, headless=headless)
                 try:
-                    process_one_well(driver, tmp_dir, OUT_BASE, uwi, selected_dashboards, force)
+                    process_one_well(
+                        driver, tmp_dir, OUT_BASE, uwi, selected_dashboards, force,
+                        manifest_retries=manifest_retries, retry_wait=retry_wait
+                    )
                 except Exception as e2:
                     print(f"[warn] worker {worker_id} retry failed: {e2}")
             pause()
@@ -653,7 +720,6 @@ def worker_main(worker_id: int, wells: List[str], selected_dashboards: List[str]
             if driver: driver.quit()
         except Exception:
             pass
-
 def chunkify(seq: List[str], n: int) -> List[List[str]]:
     n = max(1, n); k, m = divmod(len(seq), n)
     out, start = [], 0
@@ -701,6 +767,8 @@ def main():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--out-base", type=str, default=None)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--manifest-retries", type=int, default=MANIFEST_RETRIES_DEFAULT)
+    parser.add_argument("--retry-wait", type=float, default=RETRY_WAIT_DEFAULT)
     args = parser.parse_args()
 
     global OUT_BASE
@@ -719,7 +787,15 @@ def main():
     groups = chunkify(wells, args.workers)
     procs: List[Process] = []
     for wid, group in enumerate(groups, 1):
-        p = Process(target=worker_main, args=(wid, group, selected_dashboards, args.force, args.headless), daemon=False)
+        p = Process(
+            target=worker_main,
+            args=(
+                wid, group, selected_dashboards,
+                args.force, args.headless,
+                args.manifest_retries, args.retry_wait,
+            ),
+            daemon=False
+        )
         p.start(); procs.append(p)
 
     exit_code = 0

@@ -126,7 +126,8 @@ upload_loop() {{
 set +e
 python3.11 scrape_and_push.py "$WELLS_FILE" \
   --bucket "$BUCKET" --remote "$REMOTE" --prefix "$PREFIX" \
-  --out-base "$OUT_BASE" --workers 2 --dashboards "$DASH" --headless \
+  --out-base "$OUT_BASE" --workers 1 --dashboards "$DASH" --headless \
+  --manifest-retries 6 --retry-wait 10 \
   2>&1 | tee -a "$LOG" &
 
 SPID=$!
